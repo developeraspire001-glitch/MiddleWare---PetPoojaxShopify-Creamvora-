@@ -7,6 +7,8 @@ export interface CakeItemMapping {
   shopifyProductId?: string | number;
   shopifySku?: string;
   shopifyTitle?: string;
+  /** Shopify option combination, e.g. "500 GM / Sugar-Free". */
+  shopifyVariantTitle?: string;
   petpoojaItemId: string;
   petpoojaVariationId?: string;
   petpoojaVariationName?: string;
@@ -23,7 +25,7 @@ export interface CakeMappingLineItem {
   name?: string | null;
 }
 
-export type CakeMappingMatchType = "variant_id" | "sku" | "product_id" | "title";
+export type CakeMappingMatchType = "variant_id" | "title_variant" | "sku" | "product_id" | "title";
 
 export interface CakeMappingResolution {
   mapping?: CakeItemMapping;
@@ -81,7 +83,7 @@ const normId = (v: string | number | null | undefined) =>
   v === null || v === undefined || String(v).trim() === "" ? null : String(v).trim();
 
 const normText = (v: string | null | undefined) =>
-  v && v.trim() ? v.trim().toLowerCase() : null;
+  v && v.trim() ? v.trim().toLowerCase().replace(/\s*\/\s*/g, " / ").replace(/\s+/g, " ") : null;
 
 /**
  * Resolves the Petpooja item for a Shopify line item.
@@ -104,46 +106,72 @@ export function resolveCakeMapping(
   const prodIdStr = normId(line.product_id);
   const skuStr = normText(line.sku);
 
-  // 1. Variant ID
+  // Only consider a match safe when all candidates select the same POS item+variation.
+  // A duplicate Shopify SKU must never arbitrarily select the first matching cake.
+  const uniqueTarget = (candidates: CakeItemMapping[]): CakeItemMapping | undefined => {
+    if (!candidates.length) return undefined;
+    const target = (m: CakeItemMapping) => `${m.petpoojaItemId}|${m.petpoojaVariationId || ""}`;
+    return candidates.every((m) => target(m) === target(candidates[0])) ? candidates[0] : undefined;
+  };
+
+  // 1. Shopify variant ID: strongest identity, when it is available.
   if (varIdStr) {
-    const match = mappings.find((m) => normId(m.shopifyVariantId) === varIdStr);
+    const match = uniqueTarget(mappings.filter((m) => normId(m.shopifyVariantId) === varIdStr));
     if (match) return { mapping: match, matchedBy: "variant_id" };
   }
 
-  // 2. SKU
+  // 2. Exact product title + Shopify option combination: handles blank/reused SKUs.
+  // Only new entries containing shopifyVariantTitle are eligible for this tier.
+  const shopifyTitle = normText(line.title);
+  const shopifyVariantTitle = normText(line.variant_title);
+  if (shopifyTitle && shopifyVariantTitle) {
+    const match = uniqueTarget(mappings.filter((m) =>
+      normText(m.shopifyTitle) === shopifyTitle &&
+      normText(m.shopifyVariantTitle) === shopifyVariantTitle
+    ));
+    if (match) return { mapping: match, matchedBy: "title_variant" };
+  }
+
+  // 3. SKU fallback: a SKU cannot override a different Shopify product or size.
+  // Shopify's export may reuse a SKU on a product that is NOT in the mapping file.
+  // Therefore checking uniqueness among mappings alone is not sufficient.
   if (skuStr) {
-    const match = mappings.find((m) => normText(m.shopifySku) === skuStr);
+    const compatible = mappings.filter((m) =>
+      normText(m.shopifySku) === skuStr &&
+      (!m.shopifyTitle || normText(m.shopifyTitle) === shopifyTitle) &&
+      (!m.shopifyVariantTitle || normText(m.shopifyVariantTitle) === shopifyVariantTitle)
+    );
+    const match = uniqueTarget(compatible);
     if (match) return { mapping: match, matchedBy: "sku" };
   }
 
-  // 3. Product ID (must be unambiguous)
+  // 4. Product ID: only for an unambiguous, single POS target.
   let ambiguousProductCandidates: CakeItemMapping[] = [];
   if (prodIdStr) {
     const candidates = mappings.filter((m) => normId(m.shopifyProductId) === prodIdStr);
-    const distinctTargets = new Set(
-      candidates.map((m) => `${m.petpoojaItemId}|${m.petpoojaVariationId || ""}`)
-    );
-    if (candidates.length > 0 && distinctTargets.size === 1) {
-      return { mapping: candidates[0], matchedBy: "product_id" };
-    }
+    const match = uniqueTarget(candidates);
+    if (match) return { mapping: match, matchedBy: "product_id" };
     ambiguousProductCandidates = candidates;
   }
 
-  // 4. Title / cake name
+  // 5. Name fallback: do not guess if a cake has several mapped weights/types.
   const titleCandidates = [normText(line.name), normText(line.title)].filter(
     (t): t is string => Boolean(t)
   );
   if (line.title && line.variant_title) {
-    titleCandidates.push(`${line.title} (${line.variant_title})`.trim().toLowerCase());
+    titleCandidates.push(normText(`${line.title} (${line.variant_title})`)!);
   }
   if (titleCandidates.length > 0) {
-    // Prefer titles within the same Shopify product when the product ID was ambiguous
-    const pools = ambiguousProductCandidates.length > 0 ? [ambiguousProductCandidates, mappings] : [mappings];
+    const pools = ambiguousProductCandidates.length > 0
+      ? [ambiguousProductCandidates, mappings]
+      : [mappings];
     for (const pool of pools) {
-      const match = pool.find((m) => {
+      const candidates = pool.filter((m) => {
         const mapTitles = [normText(m.shopifyTitle), normText(m.cakeName)];
-        return mapTitles.some((t) => t && titleCandidates.includes(t));
+        return mapTitles.some((t) => t && titleCandidates.includes(t)) &&
+          (!m.shopifyVariantTitle || normText(m.shopifyVariantTitle) === shopifyVariantTitle);
       });
+      const match = uniqueTarget(candidates);
       if (match) return { mapping: match, matchedBy: "title" };
     }
   }
@@ -158,7 +186,7 @@ export function resolveCakeMapping(
   }
 
   return {
-    reason: "No cake mapping matches this Shopify variant ID, SKU, product ID or title",
+    reason: "No unique cake mapping matches this Shopify variant ID, title+size, SKU, product ID or title",
   };
 }
 
